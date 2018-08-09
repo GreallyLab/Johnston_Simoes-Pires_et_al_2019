@@ -33,4 +33,4 @@ EOF
 done 
 ```
 
-The generated count tables were imported into R for downstream anaylsis. Please see <a href="DEG_analysis.Rmd">
+The generated count tables were imported into R for downstream anaylsis. Please see <a href="DEG_analysis.Rmd">DEG_Analysis.Rmd</a>
