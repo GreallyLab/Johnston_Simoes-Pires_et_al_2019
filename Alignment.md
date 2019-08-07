@@ -17,11 +17,11 @@ STAR --runThreadN 20 --runMode genomeGenerate --genomeDir /home/greally-lab/inde
 EOF
 ```
 
-Next, the trimmed reads were aligned to this genome. 
+Next, the trimmed reads were aligned to this genome.
 
 ```bash
 for f1 in *_trimmed.fq.gz;
-do 
+do
 SAMPLE="$(echo ${f1} | cut -d '_' -f 5,6)"
 echo $SAMPLE
 echo $f1
@@ -30,7 +30,7 @@ module load samtools
 module load STAR
 STAR --runThreadN 20 --genomeDir /home/greally-lab/indexes/Hg38_rel79_ERCC/STAR/ --readFilesIn ${f1} --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --quantMode GeneCounts --alignIntronMin 20 --alignIntronMax 1000000 --alignMatesGapMax 1000000 --outFilterType BySJout --outFilterMultimapNmax 20 --alignSJoverhangMin 8 --alignSJDBoverhangMin 1 --outFilterMismatchNmax 999 --sjdbGTFfile /home/greally-lab/indexes/Hg38_rel79_ERCC/Homo_sapiens.GRCh38.79.ERCC.gtf --sjdbOverhang 99 --outFileNamePrefix Mapped_STAR_79_ERCC/${SAMPLE}
 EOF
-done 
+done
 ```
 
-The generated count tables were imported into R for downstream anaylsis. Please see <a href="DEG_analysis.Rmd">DEG_Analysis.Rmd</a>
+The generated count tables were imported into R for downstream anaylsis. Please see <a href="DEG_analysis.html">DEG_Analysis</a>
