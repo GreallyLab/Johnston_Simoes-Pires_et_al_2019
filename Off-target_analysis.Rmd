@@ -1,0 +1,108 @@
+---
+title: "Off-target Analysis"
+author: "Andrew D. Johnston"
+date: "08/20/2018"
+output:
+  html_document:
+  css: styles.css
+toc: yes
+toc_depth: 4
+pdf_document:
+  toc: yes
+word_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+```{r packages, echo=TRUE, warning=FALSE, message = FALSE}
+# setwd("/Volumes/home/greally-lab/Claudia_Andrew/CRISPR_Proj_combined/pileups")
+
+# set options
+options(scipen=999, stringsAsFactors = FALSE)
+```
+
+# Off-target regions near DEG TSSs?
+Is a possible off target region defined by http://crispor.tefor.net/crispor.py?batchId=0xd7m55fmDlcoF8EzTa9#s343+
+located within +/- 1kb of a TSS of a dysregulated gene? I copied the off target primers to make tables that I can manipulate to be bed files. The CFD score is based off study http://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-1012-2
+```{bash off-target, echo=TRUE, warning=FALSE, message = FALSE, eval=FALSE}
+
+  # to generate the TSSs for the GTF
+awk '$3~"transcript"' Homo_sapiens.GRCh38.79.ERCC.gtf > Homo_sapiens.GRCh38.79.ERCC.transcript.gtf 
+gtf2bed < Homo_sapiens.GRCh38.79.ERCC.transcript.gtf > Homo_sapiens.GRCh38.79.ERCC.transcript.bed
+awk -F "\t" '{OFS="\t"; if ($6=="+") print $1,$2,$2+1,$4,$5,"."; else print $1,$3-1,$3,$4,$5,"."}' Homo_sapiens.GRCh38.79.ERCC.transcript.bed > Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.bed
+
+# make TSS +/- 1kb
+awk 'BEGIN {OFS="\t";} {print $1,$2-1000,$3+1000,$4,$5,$6}' Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.bed > Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.1kb.bed
+awk 'BEGIN {OFS="\t";} {if ($2 < 0) print $1,0,$3+1000,$4,$5,$6; else print $0}' Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.1kb.bed > Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.1kb_clean.bed
+
+ # target region defined by http://crispor.tefor.net/crispor.py?batchId=0xd7m55fmDlcoF8EzTa9#s343+
+ # manipulate the files into beds that are + 1 around the off-target sites, I will add +/- 500 bp later but I need to lift over the coordinates 
+for f1 in gRNA*.txt
+do
+awk -F "\t" 'NR>3 {print $1"_"$4}' $f1 | awk -F "_" '$6~"F"' | awk -F "_" '{print $4"\t"$5"\t"$5+1"\tgRNA1_OT_"NR"\t"$7"\t."}' > ${f1%.txt}.bed
+~/Programs/LiftOverProg/liftOver ${f1%.txt}.bed ~/Programs/LiftOverProg/hg19ToHg38.over.chain "${f1%.txt}_hg38.bed" "${f1%.txt}_unmapped.bed"
+done
+
+wc -l *unmapped*
+ # all of the gRNA off targets were mapped.
+
+ # I need to add the +/- 500 bp and get rid of 'chr' prefix on the gRNA files 
+for f1 in gRNA*hg38.bed
+do
+awk -F "\t" '{OFS="\t";print $1,$2-500,$3+499,$4,$5,$6}' $f1 | sed 's/^chr//' > ${f1%.bed}_nochr.bed
+done
+
+# intersect
+module load bedtools2/2.26.0/gcc.4.4.7
+for f1 in gRNA*nochr.bed
+do
+echo $f1
+bedtools intersect -a $f1 -b /home/greally-lab/indexes/Hg38_rel79_ERCC/Homo_sapiens.GRCh38.79.ERCC.transcript.TSS.1kb_clean.bed -wo > ${f1%_off_targets_hg38_nochr.bed}_inter_TSS_1kb.txt
+done
+
+wc -l *_inter_TSS_1kb.txt
+23 gRNA1_inter_TSS_1kb.txt
+  18 gRNA2_inter_TSS_1kb.txt
+  11 gRNA3_inter_TSS_1kb.txt
+  43 gRNA4_inter_TSS_1kb.txt
+  56 gRNA5_inter_TSS_1kb.txt
+  16 gRNA6_inter_TSS_1kb.txt
+ 167 total
+ 
+```
+
+```{r off-target-r, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+# read in DE genes
+genes <- read.csv("../ruv_res_con_C34_CRISPR_pc_com_sig2.txt", header=T)
+head(genes)
+
+# read in intersection +/- 1kb
+inter_1kb <- NULL
+file_inter_1 <-  grep("_inter_TSS_1kb.txt", x = list.files(path = "."), value = T)
+i <-1
+for (i in 1:length(file_inter_1)){
+  x <- read.table(file_inter_1[i], header = F)
+  inter_1kb <- rbind(inter_1kb, x)
+}
+head(inter_1kb)
+dim(inter_1kb)
+
+# any gene overlap?
+merge_1kb <- merge(x=inter_1kb, y=genes, by.x= "V10", by.y="Ensembl_ID")
+head(merge_1kb)
+dim(merge_1kb)
+# sanity check
+sum(inter_1kb$V10 %in% genes$Ensembl_ID)
+head(inter_1kb$V10)
+```
+No overlap of the predicted off-target sites and the dysregulated genes. 
+
+
+Outputting the Session Info
+```{r sessionInfo, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+sessionInfo()
+```
