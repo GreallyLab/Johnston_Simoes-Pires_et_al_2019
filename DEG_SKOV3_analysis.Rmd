@@ -1,0 +1,671 @@
+---
+title: "Analysis of defense response due to Cas9 system in SKOV3 cells"
+author: "Andrew D. Johnston"
+date: "03/23/2020"
+output:
+  html_document:
+  css: styles.css
+toc: yes
+toc_depth: 4
+pdf_document:
+  toc: yes
+word_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+```{r packages,echo=TRUE, warning=FALSE, message = FALSE}
+setwd("/Volumes/home-1/greally-lab/Claudia_Andrew/Lu_et_al/DESeq2/")
+
+# load in libraries 
+library(DESeq2)
+library(EDASeq)
+library(matrixStats)
+library(RUVSeq)
+library(qvalue)
+library(genefilter)
+library(RColorBrewer)
+library(pheatmap)
+library(UpSetR)
+library(RFmarkerDetector)
+library(ggplot2)
+library(ggthemes)
+library(VennDiagram)
+library(GeneOverlap)
+
+# set options
+options(scipen=999, stringsAsFactors = FALSE)
+```
+
+
+For the revision of "A cellular stress response induced by the CRISPR/dCas9 activation system is not heritable through cell divisions", Lu et al 2019 data was analyzed to examine if a similar stress response was observed in their experiments. Specifically, they transfected Cas9 to knockout STAT3 in SKOV3 cells (ovarian cancer cell line). More information at https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE134375
+
+Not only did they compare the wild type SKOV3 cell line with KO-STAT3 via CRISPR cells BUT also examined transfection with Cas9 w/o gRNA vs. the CRIPSR KO cell line in a separate experiment. While I will look at the data quality from both experimental designs, I'm going to be assessing the difference between WT cells and the Cas9 control, which of note are from different experimental timings. 
+
+First we read in the data from count data.
+```{r read-in,echo=TRUE, warning=FALSE, message = FALSE}
+# reading in and merging the counts
+
+## selecting the files ot read in
+dir_file <- "../Mapped_STAR_79/"
+files <- grep(pattern = "ReadsPerGene.out.tab", x = list.files(path = dir_file), value = TRUE)
+
+files
+
+list_counts <- list()
+for (i in 1:length(files)){
+  list_counts[[i]] <- read.table(paste(dir_file,files[i], sep =""))
+  if (i < 2) {
+    df_counts <- list_counts[[1]][,c(1,4)]
+  }
+  else {
+    df_counts <- merge(df_counts, list_counts[[i]][,c(1,4)], by = "V1")
+  }
+}
+dim(df_counts) #  60700    13
+tail(df_counts)
+## remove the ambiguous, multimapp, no feature, and unmapped read totals
+df_counts <- df_counts[-c(60697:60700),]
+rownames(df_counts) <- df_counts[,1]
+df_counts <- df_counts[,-1]
+
+colnames(df_counts) <- c("Cas9_1", "Cas9_2", "Cas9_3", "STAT3_1", "STAT3_2",
+                         "STAT3_3", "KOSTAT3_1", "KOSTAT3_2","KOSTAT3_3",
+                         "WT_1", "WT_2", "WT3")
+head(df_counts)
+```
+
+Next we filter the RNAs to be analzyed. First, we apply a simple filter for only 
+those RNAs that are expressed at high levels. The RNA must have at least 5 counts 
+in four of the samples, thus allowing only genes expressed by only one treatment
+group to be retained. Next, we filter for protein coding genes only or protein
+coding and long non-coding RNAs.
+
+```{r combine-filter, echo=TRUE, warning=FALSE, message = FALSE}
+# expression filter
+idx_filt_exp_com <- apply(df_counts, 1, function(x) length(x[x>5])>=4) 
+head(idx_filt_exp_com)
+filtered_com <- df_counts[idx_filt_exp_com,]
+dim(filtered_com) # 17,687     12
+
+# filter for only protein coding RNAs
+prot_ensg_ID <- read.table("../../../indexes/Hg38_rel79_ERCC/prot_ENSG.txt")
+dim(prot_ensg_ID) # 22002     1
+filterd_com_pc <- filtered_com[
+  rownames(filtered_com) %in% prot_ensg_ID$V1,]
+dim(filterd_com_pc) # 13721    6
+
+```
+
+Let's look at the PCA and RLE plots.
+
+```{r combine-EDA, echo=TRUE, warning=FALSE, message = FALSE}
+
+# resorting the columns so that experiment samples are next to each other
+filterd_com_pc <- filterd_com_pc[,c(10:12,4:6,1:3,7:9)]
+head(filterd_com_pc)
+
+# set a factor for different treatments
+treatments_com <- as.factor(c(rep(c("Ctrl","STAT3"), each=3),rep(c("CRISPR","STAT3"), each=3))) 
+treatments_com <- relevel(treatments_com, c("Ctrl"))
+experiment_com <- as.factor(rep(c("Exp1", "Exp2"),each=6))
+
+# create expression sets 
+eset_pc_com <- newSeqExpressionSet(as.matrix(filterd_com_pc),
+                                  phenoData = data.frame(treatments_com, 
+                                                   row.names=colnames(filterd_com_pc)))
+
+# choose a color set
+colors_com <- brewer.pal(6, "Dark2")
+colors <- brewer.pal(3, "Dark2")
+
+
+# Make RLE plots
+plotRLE(eset_pc_com, outline=FALSE, ylim=c(-4, 4), col=colors[treatments_com],
+        main="Protein coding RNAs before normalization") 
+limma::plotMDS(counts(eset_pc_com), dim=c(2,3))
+
+# Make PCA plots
+plotPCA(eset_pc_com, col=colors[treatments_com], cex=1.2, 
+        main = "Protein coding RNAs before normalization")
+plotPCA(eset_pc_com, k=3, col=colors[treatments_com], cex=1.2, 
+        main="Protein coding RNAs before normalization") 
+plotPCA(eset_pc_com, k=3, col=colors[experiment_com], cex=1.2, 
+        main="Protein coding RNAs before normalization") 
+
+```
+
+The STAT3 KO treatment groups cluster together as expected in PC1. And the two experiments are defined by PC2.
+
+Next we normalize based on housekeeping gene expression. House keeping genes were
+identified by a previous study "Human housekeeping genes revisited" E. Eisenberg
+and E.Y. Levanon, Trends in Genetics, 29 (2013) and a list is avaialble for 
+download at (https://www.tau.ac.il/~elieis/HKG/). We took only the bottom quartile 
+variance house keeping genes to use for normalization.
+```{r combine-normalize, echo=TRUE, warning=FALSE, message = FALSE}
+
+# read in house keeping genes 
+HK_genes <- read.table("../../CRISPR_Proj_combined/HK_ensembl_ID.txt")
+dim(HK_genes) # 4202    1
+
+# grab the HK genes from RNAs being analyzed 
+HK_pc_com <- filterd_com_pc[which(rownames(filterd_com_pc) %in% HK_genes[,1]),]
+dim(HK_pc_com) # 3755    12
+
+# examine the variance of the HK genes and take only the bottom 1000 genes to normalize with
+## for protein coding RNAs only
+HK_pc_com_rsd <- apply(as.matrix(HK_pc_com), 1, rsd)
+boxplot(HK_pc_com_rsd)
+summary(HK_pc_com_rsd)
+HK_pc_lowRSD <- sort(HK_pc_com_rsd)[1:1000]
+
+# Normalize using the house keeping genes
+eset_pc_norm_com <- RUVg(eset_pc_com, names(HK_pc_lowRSD), k=1) 
+
+# The weights have been added to the phenotype data
+pData(eset_pc_norm_com)
+
+# Make RLE plots
+plotRLE(eset_pc_norm_com, outline=FALSE, ylim=c(-4, 4), col=colors[treatments_com],
+        main="Protein coding RNAs after normalization") 
+
+# Make PCA plots
+plotPCA(eset_pc_norm_com, col=colors[treatments_com], cex=1.2, 
+        main = "Protein coding RNAs after normalization")
+plotPCA(eset_pc_norm_com, k=3, col=colors[treatments_com], cex=1.2, 
+        main="Protein coding RNAs after normalization") 
+
+```
+
+The normalized data looks more askew than before normalization. Therefore, we will perform DE gene analyis on the non-RUVg normalized data set `eset_pc_com`. 
+
+
+Next, we perform the differential expression among the different treatments
+```{r combine-DEseq, echo=TRUE, warning=FALSE, message = FALSE}
+
+#adding the replicates information to the pData
+pData(eset_pc_com) <- cbind(pData(eset_pc_com), experiment_com)
+
+# convert the expression set to a DESeq object
+
+# WT vs. STAT3 control
+treatments_ctrl <- as.factor(rep(c("Ctrl","STAT3"), each=3)) 
+pdata_ws <- pData(eset_pc_com)[1:6,]
+pdata_ws$treatments_ctrl <- as.factor(as.character(pdata_ws$treatments_com))
+dds_wt_Stat3 <- DESeqDataSetFromMatrix(countData = counts(eset_pc_com)[,1:6], 
+                                    colData = pdata_ws, 
+                                    design = ~treatments_ctrl)
+# Cas9 vs. STATKO
+treatments_crisp <- as.factor(rep(c("CRISPR","STAT3"), each=3)) 
+treatments_crisp <- relevel(treatments_crisp, c("CRISPR"))
+pdata_cs <- pData(eset_pc_com)[7:12,]
+pdata_cs$treatments_crisp <- as.factor(as.character(pdata_cs$treatments_com))
+dds_CRISPR_Stat3 <- DESeqDataSetFromMatrix(countData = as.matrix(counts(eset_pc_com)[,7:12]), 
+                                    colData = pdata_cs, 
+                                    design = ~treatments_crisp)
+
+# WT vs. Cas9 Control
+treatments_wt <- as.factor(rep(c("Ctrl","CRISPR"), each=3)) 
+treatments_wt <- relevel(treatments_wt, c("Ctrl"))
+pdata_wt <- pData(eset_pc_com)[c(1:3,7:9),]
+pdata_wt$treatments_wt <- as.factor(as.character(pdata_wt$treatments_com))
+pdata_wt$treatments_wt <- relevel(pdata_wt$treatments_wt, "Ctrl")
+
+dds_wt_CRISPR <- DESeqDataSetFromMatrix(countData = counts(eset_pc_com)[,c(1:3,7:9)], 
+                                    colData = pdata_wt, 
+                                    design = ~treatments_wt)
+
+# Run DESeq Wald tests
+dds_wt_Stat3 <- DESeq(dds_wt_Stat3)
+dds_CRISPR_Stat3 <- DESeq(dds_CRISPR_Stat3)
+dds_wt_CRISPR <- DESeq(dds_wt_CRISPR)
+
+
+# generate results among the different treatments_com and set a log fold change threshold of 1
+res_wt_Stat3 <- results(dds_wt_Stat3, lfcThreshold=1, altHypothesis="greaterAbs", 
+                       contrast = c("treatments_ctrl", "STAT3", "Ctrl"), alpha=0.05)
+
+res_CRISPR_Stat3 <- results(dds_CRISPR_Stat3, lfcThreshold=1, altHypothesis="greaterAbs", 
+                       contrast = c("treatments_crisp", "STAT3", "CRISPR"), alpha=0.05)
+
+res_wt_CRISPR <- results(dds_wt_CRISPR, lfcThreshold=1, altHypothesis="greaterAbs", 
+                       contrast = c("treatments_wt", "CRISPR", "Ctrl"), alpha=0.05)
+
+# draw MA plots of results 
+## draw horizontal lines for log fold change threshold
+drawLines <- function() abline(h=c(-1,1),col="dodgerblue",lwd=2)
+ylim<-c(-8,8)
+
+##draw the MA plots
+DESeq2::plotMA(res_wt_Stat3, 
+               main="WT vs STAT3"); drawLines()
+
+DESeq2::plotMA(res_CRISPR_Stat3, 
+               main="CRISPR vs STAT3-KO"); drawLines()
+
+DESeq2::plotMA(res_wt_CRISPR,
+               main="WT vs. CRISPR", ylim=ylim); drawLines()
+# graphs show that STAT3 KO affects many genes 
+
+# looking at the summaries
+summary(res_wt_Stat3) # 1921 up and 1496 down
+summary(res_CRISPR_Stat3) # 2435 up and 1765 down
+summary(res_wt_CRISPR) # 415 up and 1294
+
+# grabbing the ENSG IDs from the differentially expressed genes 
+res_wt_Stat3_nona <- res_wt_Stat3[!is.na(res_wt_Stat3$padj),]
+res_wt_Stat3_nona_IDs <- rownames(res_wt_Stat3_nona)[res_wt_Stat3_nona$padj<0.05]
+length(res_wt_Stat3_nona_IDs) #3417
+num_WTvSTAT3 <- length(res_wt_Stat3_nona_IDs) 
+
+res_CRISPR_Stat3_nona <- res_CRISPR_Stat3[!is.na(res_CRISPR_Stat3$padj),]
+res_CRISPR_Stat3_nona_IDs <- rownames(res_CRISPR_Stat3_nona)[res_CRISPR_Stat3_nona$padj<0.05]
+length(res_CRISPR_Stat3_nona_IDs) #4200
+num_CRISPRvSTAT3 <- length(res_CRISPR_Stat3_nona_IDs) 
+
+res_wt_CRISPR_nona <- res_wt_CRISPR[!is.na(res_wt_CRISPR$padj),]
+res_wt_CRISPR_nona_IDs <- rownames(res_wt_CRISPR_nona)[res_wt_CRISPR_nona$padj<0.05]
+length(res_wt_CRISPR_nona_IDs) #1709
+num_WTvCRISPR <- length(res_wt_CRISPR_nona_IDs) 
+
+# what's the overlap amongst the three comparisons?
+WTvCRISPR_over_WTvSTAT3_IDs <- res_wt_CRISPR_nona_IDs[(res_wt_CRISPR_nona_IDs %in% res_wt_Stat3_nona_IDs)]
+WTvCRISPR_over_CRISPRvSTAT3_IDs <- res_wt_CRISPR_nona_IDs[(res_wt_CRISPR_nona_IDs %in% res_CRISPR_Stat3_nona_IDs)]
+
+sum(WTvCRISPR_over_WTvSTAT3_IDs %in% WTvCRISPR_over_CRISPRvSTAT3_IDs)
+```
+
+Let's make an upset plot of the overlaps between the three DEG comparisons. 
+
+```{r upset-plot, echo=TRUE, warning=FALSE, message = FALSE}
+sum(res_wt_Stat3_nona_IDs %in% res_CRISPR_Stat3_nona_IDs) # 2948 are the same 
+sum(res_wt_CRISPR_nona_IDs %in% res_wt_Stat3_nona_IDs) # 399 are the same 
+sum(res_wt_CRISPR_nona_IDs %in% res_CRISPR_Stat3_nona_IDs) # 434 are the same 
+
+# Setting up the dataframe for the upset plot. 
+upset_wt_STAT3 <- data.frame(Gene=res_wt_Stat3_nona_IDs,
+                                                  Wt_STAT3=1)
+upset_wt_CRISPR <- data.frame(Gene=res_wt_CRISPR_nona_IDs,
+                                                  WT_CRIPSR=1)
+upset_CRISPR_STAT3 <- data.frame(Gene=res_CRISPR_Stat3_nona_IDs,
+                                                  CRIPSR_STAT3=1)
+upsetdf_merge_1 <- merge(upset_wt_STAT3, 
+                            upset_wt_CRISPR,
+                            by="Gene", all=T)
+upsetdf_merge_2 <- merge(upsetdf_merge_1, upset_CRISPR_STAT3,
+                            by="Gene", all=T)
+dim(upsetdf_merge_2) # 189   3
+
+upsetdf_final<- replace(upsetdf_merge_2,is.na(upsetdf_merge_2),0)
+
+upset(upsetdf_final, nsets = 3, number.angles = 0, point.size = 3.5, 
+      line.size = 1.5, mainbar.y.label = "DE Gene Intersections", 
+      sets.x.label = "# of DE Genes", text.scale = c(1.3, 1, 1, 1, 1, 1), order.by = "freq")
+```
+
+Comparing our study wtih the WT vs CRISPR
+
+```{r Compare-studies, echo=TRUE, warning=FALSE, message = FALSE}
+# read in our 97 gene list
+res_us_com <- read.table("../../CRISPR_Proj_combined/DEG_CRISPR_CD34_combined.txt", header=T)
+dim(res_us_com)
+
+sum(res_wt_CRISPR_nona_IDs %in% res_us_com$ENSEMBL) # 13
+sum(res_wt_Stat3_nona_IDs %in% res_us_com$ENSEMBL) # 34 
+sum(res_CRISPR_Stat3_nona_IDs %in% res_us_com$ENSEMBL) # 43
+
+# GOI = genes of interest
+#ENSG00000171223      JUNB
+#ENSG00000104856      RELB
+# ENSG00000175197     DDIT3
+
+GOI <- res_us_com[which(res_us_com$SYMBOL %in% c("JUNB", "RELB", "DDIT3")),]
+res_wt_CRISPR_nona_IDs[(res_wt_CRISPR_nona_IDs %in% GOI$ENSEMBL)] # 2
+res_wt_Stat3_nona_IDs[(res_wt_Stat3_nona_IDs %in% GOI$ENSEMBL)] # 2
+res_CRISPR_Stat3_nona_IDs[(res_CRISPR_Stat3_nona_IDs %in% GOI$ENSEMBL)] # 2
+
+# plot the GOI genes
+class(GOI$ENSEMBL[1])               
+#plotCounts(dds_wt_Stat3, gene=GOI$ENSEMBL[1], intgroup=c("treatments_ctrl"))
+#plotCounts(dds_wt_Stat3, gene=GOI$ENSEMBL[2], intgroup=c("treatments_ctrl"))
+#plotCounts(dds_wt_Stat3, gene=GOI$ENSEMBL[3], intgroup=c("treatments_ctrl"))
+
+#plotCounts(dds_CRISPR_Stat3, gene=GOI$ENSEMBL[1], intgroup=c("treatments_crisp"))
+plotCounts(dds_CRISPR_Stat3, gene="ENSG00000171223", intgroup=c("treatments_crisp"))
+plotCounts(dds_CRISPR_Stat3, gene="ENSG00000175197", intgroup=c("treatments_crisp"))
+
+plotCounts(dds_wt_CRISPR, gene="ENSG00000104856", intgroup=c("treatments_wt"), 
+           main="RELB - WT v Cas9-ctrl")
+plotCounts(dds_wt_CRISPR, gene="ENSG00000171223", intgroup=c("treatments_wt"),
+           main="JUNB - WT v Cas9-ctrl")
+plotCounts(dds_wt_CRISPR, gene="ENSG00000175197", intgroup=c("treatments_wt"),
+           main="DDIT3 - WT v Cas9-ctrl") #DDIT3 not sig :-/ 
+
+# Make pdfs of ggplot versions:
+# pdf("VennD_David_v_Lu.pdf", width=6, height = 4, family="ArialMT")
+data_RELB <- plotCounts(dds_wt_CRISPR, gene="ENSG00000104856", intgroup=c("treatments_wt"), returnData=TRUE)
+data_JUN <- plotCounts(dds_wt_CRISPR, gene="ENSG00000171223", intgroup=c("treatments_wt"), returnData=TRUE)
+data_DDIT3 <- plotCounts(dds_wt_CRISPR, gene="ENSG00000175197", intgroup=c("treatments_wt"), returnData=TRUE)
+
+library(scales)
+
+col_blind<- colorblind_pal()(8)
+RelB_ggcount <- ggplot(data_RELB, aes(x=treatments_wt, y=count, fill=treatments_wt)) +
+  scale_y_log10(limits=c(70,1300)) + 
+  scale_fill_manual(values=c(col_blind[2], col_blind[4]))+
+  geom_dotplot(binaxis="y", stackdir="center") +
+  xlab("Condition")+
+  ylab("Raw Counts (log10 scale)")+
+  theme_hc()
+ggsave(plot = RelB_ggcount, filename = "RelB_ggcount.pdf", width=2.5, height=4, useDingbats=FALSE)
+
+JUNB_ggcount <- ggplot(data_JUN, aes(x=treatments_wt, y=count, fill=treatments_wt)) +
+  scale_y_log10(limits=c(70,1300)) +
+  scale_fill_manual(values=c(col_blind[2], col_blind[4]))+
+  geom_dotplot(binaxis="y", stackdir="center") +
+  xlab("Condition")+
+  ylab("Raw Counts (log10 scale)")+
+  theme_hc()
+ggsave(plot = JUNB_ggcount, filename = "JUNB_ggcount.pdf", width=2.5, height=4, useDingbats=FALSE)
+
+DDIT3_ggcount <- ggplot(data_DDIT3, aes(x=treatments_wt, y=count, fill=treatments_wt)) +
+  scale_y_log10(limits=c(70,1300)) +
+  scale_fill_manual(values=c(col_blind[2], col_blind[4]))+
+  geom_dotplot(binaxis="y", stackdir="center") +
+  xlab("Condition")+
+  ylab("Raw Counts (log10 scale)")+
+  theme_hc()
+ggsave(plot = DDIT3_ggcount, filename = "DDIT3_ggcount.pdf", width=2.5, height=4, useDingbats=FALSE)
+
+#Get Pvalues for GOI
+res_wt_CRISPR_nona[which(rownames(res_wt_CRISPR_nona)%in% GOI$ENSEMBL),]
+#                                 pvalue                   padj
+#                              <numeric>              <numeric>
+# ENSG00000104856 0.000000237503050388141 0.00000461562531886388
+# ENSG00000171223    0.000308077005136469    0.00333480282843761
+# ENSG00000175197                       1                      1
+
+#Get DEGs info for intersecting DAVID genes
+# load DAVID gene table 
+david_genes <- read.table("DAVID_Genes.txt", header = F, sep="\t")
+
+# overlapping?
+sum(res_wt_CRISPR_nona_IDs %in% david_genes$V1) # 10
+sum(res_wt_Stat3_nona_IDs %in% david_genes$V1) # 14
+sum(res_CRISPR_Stat3_nona_IDs %in% david_genes$V1) # 11
+
+# output table
+lu_DEG_intersect <- res_wt_CRISPR_nona[which(rownames(res_wt_CRISPR_nona) %in% david_genes$V1),]
+dim(lu_DEG_intersect)
+lu_DEG_intersect_sig <- lu_DEG_intersect[lu_DEG_intersect$padj<0.05,]
+dim(lu_DEG_intersect_sig)
+head(lu_DEG_intersect_sig)
+write.table(lu_DEG_intersect_sig, "lu_DAVID_intersect_sig.txt",append = F, row.names = T, col.names=T, quote=F, sep = "\t")
+
+# is p53 expressed in SKOV3 cells?
+plotCounts(dds_wt_CRISPR, gene="ENSG00000141510", intgroup=c("treatments_wt"),
+           main="DDIT3 - WT v Cas9-ctrl")
+res_wt_CRISPR_nona[which(rownames(res_wt_CRISPR_nona) == "ENSG00000141510"),]
+```
+
+
+Figuring out how many prot coding genes analyzed in our analysis
+
+```{r read-in-johnston,echo=TRUE, warning=FALSE, message = FALSE}
+# reading in and merging the counts
+dir_claudia <- "../../CRISPR_Proj_combined/"
+## selecting the files ot read in
+files_claudia <- grep(pattern = "ReadsPerGene.out.tab", x = list.files(path=dir_claudia), value = TRUE)
+
+files_claudia
+
+list_counts_c <- list()
+for (i in 1:length(files_claudia)){
+  list_counts_c[[i]] <- read.table(paste(dir_claudia, files_claudia[i],sep=""))
+  if (i < 2) {
+    df_counts_c <- list_counts_c[[1]][,c(1,4)]
+  }
+  else {
+    df_counts_c <- merge(df_counts_c, list_counts_c[[i]][,c(1,4)], by = "V1")
+  }
+}
+dim(df_counts_c) #  60700    13
+
+## remove the ambiguous, multimapp, no feature, and unmapped read totals
+df_counts_c <- df_counts_c[-c(60697:60700),]
+rownames(df_counts_c) <- df_counts_c[,1]
+df_counts_c <- df_counts_c[,-1]
+
+colnames(df_counts_c) <- c("Ctrl_1_1", "Ctrl_1_2", "CRISPR_1_1", "CRISPR_1_2", "CD34_1_1",
+                         "CD34_1_2", "CD34_2_1", "CD34_2_2", "CRISPR_2_1","CRISPR_2_2",
+                         "Ctrl_2_1", "Ctrl_2_2")
+head(df_counts_c)
+```
+
+Next we filter the RNAs to be analzyed. First, we apply a simple filter for only 
+those RNAs that are expressed at high levels. The RNA must have at least 5 counts 
+in four of the samples, thus allowing only genes expressed by only one treatment
+group to be retained. Next, we filter for protein coding genes only or protein
+coding and long non-coding RNAs.
+
+```{r combine-filter-johnston, echo=TRUE, warning=FALSE, message = FALSE}
+# expression filter
+idx_filt_exp_com_c <- apply(df_counts_c, 1, function(x) length(x[x>5])>=4) 
+head(idx_filt_exp_com_c)
+filtered_com_c <- df_counts_c[idx_filt_exp_com_c,]
+dim(filtered_com_c) # 19,244     12
+
+# remove spike ins
+spikes_com <- grep("ERCC", rownames(filtered_com_c))
+length(spikes_com) # 12
+filterd_noSpike_com_c <- filtered_com_c[-spikes_com,]
+dim(filterd_noSpike_com_c) # 19232 12
+
+# filter for only protein coding RNAs
+filterd_noSpike_pc_com_c <- filterd_noSpike_com_c[
+  rownames(filterd_noSpike_com_c) %in% prot_ensg_ID$V1,]
+dim(filterd_noSpike_pc_com_c) # 14260    6
+```
+
+Now we know the number of prot coding genes that were analyzed by our study. With this information, we can more stringently test for overlaps of HEK293T significant genes overlapping with those of Lu et al's SKOV3.
+
+Performing the gene overlap analysis
+```{r GeneOverlap, echo=TRUE, warning=FALSE, message = FALSE}
+
+#Assessing true gene set size
+merge_protcoding <- merge(x= filterd_noSpike_pc_com_c, y=filterd_com_pc, by="row.names", all=TRUE)
+num_genes_inboth <-nrow(merge_protcoding)
+
+# Performing GeneOverlap analysis on DAVID
+#go_david <- newGeneOverlap(david_genes$V1, res_wt_CRISPR_nona_IDs,            genome.size=nrow(prot_ensg_ID))
+go_david <- newGeneOverlap(david_genes$V1, res_wt_CRISPR_nona_IDs,            genome.size=num_genes_inboth)
+go_david <- testGeneOverlap(go_david)
+print(go_david)
+getIntersection(go_david)
+
+# Performing GeneOverlap analysis for DEG 97 genes 
+#go_DEG <- newGeneOverlap(res_us_com$ENSEMBL, res_wt_CRISPR_nona_IDs,            genome.size=nrow(prot_ensg_ID))
+go_DEG <- newGeneOverlap(res_us_com$ENSEMBL, res_wt_CRISPR_nona_IDs,            genome.size=num_genes_inboth)
+go_DEG <- testGeneOverlap(go_DEG)
+print(go_DEG)
+getIntersection(go_DEG)
+```
+
+
+Making a diagram of the overlap between treatment comparisons
+```{r VennDiagram, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+Num_david <- nrow(david_genes)
+Num_wt_CRISPR_IDs <- length(res_wt_CRISPR_nona_IDs)
+Num_Overlap_wt_CRISPR_david <- sum(res_wt_CRISPR_nona_IDs %in% david_genes$V1)
+
+library(VennDiagram)
+grid.newpage()
+draw.pairwise.venn(Num_david, Num_wt_CRISPR_IDs, Num_Overlap_wt_CRISPR_david, 
+                   category = c("David Identified Genes\nCurrent Study", 
+                                "WT vs. dCas9 Control\nLu et al."), 
+                   lty = rep("blank", 2), fill = c("#7570B3", "#D95F02"),
+                   alpha = rep(0.5, 2), cat.pos = c(0, 0), 
+                   cat.dist = rep(0.025, 2))
+
+pdf("VennD_David_v_Lu.pdf", width=6, height = 4, family="ArialMT")
+draw.pairwise.venn(Num_david, Num_wt_CRISPR_IDs, Num_Overlap_wt_CRISPR_david, 
+                   category = c("David Identified Genes\nCurrent Study", 
+                                "WT vs. dCas9 Control\nLu et al."), 
+                   lty = rep("blank", 2), fill = c("#7570B3", "#D95F02"),
+                   alpha = rep(0.5, 2), cat.pos = c(0, 0), 
+                   cat.dist = rep(0.025, 2))
+dev.off()
+
+# all 97 DEGs 
+num_combined <- nrow(res_us_com)
+Num_Overlap_wt_CRISPR_combined <- sum(res_wt_CRISPR_nona_IDs %in% res_us_com$ENSEMBL)
+
+draw.pairwise.venn(num_combined, Num_wt_CRISPR_IDs, Num_Overlap_wt_CRISPR_combined, 
+                   category = c("DEG Current Study", 
+                                "WT vs. dCas9 Control\nLu et al."), 
+                   lty = rep("blank", 2), fill = c("#7570B3", "#D95F02"),
+                   alpha = rep(0.5, 2), cat.pos = c(0, 0), 
+                   cat.dist = rep(0.025, 2))
+pdf("VennD_DEG_v_Lu.pdf", width=6, height = 4, family="ArialMT")
+draw.pairwise.venn(num_combined, Num_wt_CRISPR_IDs, Num_Overlap_wt_CRISPR_combined, 
+                   category = c("DEG Current Study", 
+                                "WT vs. dCas9 Control\nLu et al."), 
+                   lty = rep("blank", 2), fill = c("#7570B3", "#D95F02"),
+                   alpha = rep(0.5, 2), cat.pos = c(0, 0), 
+                   cat.dist = rep(0.025, 2))
+dev.off()
+```
+
+
+Now to MAplots highlighting the three genes of interest 
+
+```{r MAplot-Ctrl-CRISPR-goi, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+color_genes <- c("#000000", "#FF0000", "#0432FF", "#548235", "#FF9300") 
+
+# color genes
+res_wt_CRISPR$color <- 1
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000174059"] <- 2 # CD34
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000104856"] <- 3 # Rel B
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000077150"] <- 1 # NFkb2
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000175197"] <- 5 # DDIT3
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000171223"] <- 6 # JunB
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000175592"] <- 1 # FOSL1
+res_wt_CRISPR$color[rownames(res_wt_CRISPR)=="ENSG00000101255"] <- 1 # TRIB3
+
+# make non-DE transparent
+res_wt_CRISPR$trans <- 0.1
+res_wt_CRISPR$trans[which(res_wt_CRISPR$padj < 0.05)] <- 1 
+
+# make CD34/genes larger
+res_wt_CRISPR$size <- 1
+GOI <- c("ENSG00000174059", "ENSG00000175197", "ENSG00000171223", "ENSG00000104856")
+
+#GOI <- c("ENSG00000174059", "ENSG00000101255", "ENSG00000077150", "ENSG00000175197",
+#         "ENSG00000171223", "ENSG00000175592", "ENSG00000104856")
+
+res_wt_CRISPR$size[rownames(res_wt_CRISPR) %in% GOI] <- 1.5
+
+res_wt_CRISPR_df <- as.data.frame(res_wt_CRISPR)
+res_wt_CRISPR_df$color <- factor(res_wt_CRISPR_df$color)
+MAplot_wt_v_CRISPR_GOI <- ggplot(data = res_wt_CRISPR_df, aes(x = baseMean, y = log2FoldChange, color = color, alpha = trans, size=size)) +
+  geom_point() +
+  scale_x_continuous(trans = 'log10') +
+  scale_alpha_continuous(guide=FALSE) +
+  scale_size_continuous(guide=FALSE, range = c(1,3)) +
+  scale_color_manual(values=color_genes, guide=FALSE) +
+  ylim(c(-7, 7)) +
+  geom_hline(yintercept=c(-1,1), linetype="dotted") +
+  xlab("mean expression") +
+  ylab("log fold change") +
+  ggtitle("WT vs. CRISPR") +
+  theme_tufte()
+MAplot_wt_v_CRISPR_GOI
+ggsave(plot = MAplot_wt_v_CRISPR_GOI, filename = "MAplot_wt_v_CRISPR_GOI.pdf", width=6, height=4, useDingbats=FALSE)
+```
+
+```{r MAplot-CRISPR-STAT3-goi, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+
+# color genes
+res_CRISPR_Stat3$color <- 1
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000174059"] <- 2 # CD34
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000104856"] <- 3 # Rel B
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000077150"] <- 1 # NFkb2
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000175197"] <- 5 # DDIT3
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000171223"] <- 6 # JunB
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000175592"] <- 1 # FOSL1
+res_CRISPR_Stat3$color[rownames(res_CRISPR_Stat3)=="ENSG00000101255"] <- 1 # TRIB3
+
+# make non-DE transparent
+res_CRISPR_Stat3$trans <- 0.1
+res_CRISPR_Stat3$trans[which(res_CRISPR_Stat3$padj < 0.05)] <- 1 
+
+# make CD34/genes larger
+res_CRISPR_Stat3$size <- 1
+GOI <- c("ENSG00000174059", "ENSG00000175197", "ENSG00000171223", "ENSG00000104856")
+
+res_CRISPR_Stat3$size[rownames(res_CRISPR_Stat3) %in% GOI] <- 1.5
+
+res_CRISPR_Stat3_df <- as.data.frame(res_CRISPR_Stat3)
+res_CRISPR_Stat3_df$color <- factor(res_CRISPR_Stat3_df$color)
+MAplot_CRISPR_v_STAT3_GOI <- ggplot(data = res_CRISPR_Stat3_df, aes(x = baseMean, y = log2FoldChange, color = color, alpha = trans, size=size)) +
+  geom_point() +
+  scale_x_continuous(trans = 'log10') +
+  scale_alpha_continuous(guide=FALSE) +
+  scale_size_continuous(guide=FALSE, range = c(1,3)) +
+  scale_color_manual(values=color_genes, guide=FALSE) +
+  ylim(c(-15, 15)) +
+  geom_hline(yintercept=c(-1,1), linetype="dotted") +
+  xlab("mean expression") +
+  ylab("log fold change") +
+  ggtitle("CRISPR vs. STAT3") +
+  theme_tufte()
+MAplot_CRISPR_v_STAT3_GOI
+ggsave(plot = MAplot_CRISPR_v_STAT3_GOI, filename = "MAplot_CRISPR_v_STAT3_GOI.pdf", width=6, height=4, useDingbats=FALSE)
+```
+
+```{r MAplot-wt-STAT3-goi, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+
+# color genes
+res_wt_Stat3$color <- 1
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000174059"] <- 2 # CD34
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000104856"] <- 3 # Rel B
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000077150"] <- 1 # NFkb2
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000175197"] <- 5 # DDIT3
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000171223"] <- 6 # JunB
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000175592"] <- 1 # FOSL1
+res_wt_Stat3$color[rownames(res_wt_Stat3)=="ENSG00000101255"] <- 1 # TRIB3
+
+# make non-DE transparent
+res_wt_Stat3$trans <- 0.1
+res_wt_Stat3$trans[which(res_wt_Stat3$padj < 0.05)] <- 1 
+
+# make CD34/genes larger
+res_wt_Stat3$size <- 1
+res_wt_Stat3$size[rownames(res_wt_Stat3) %in% GOI] <- 1.5
+
+res_wt_Stat3_df <- as.data.frame(res_wt_Stat3)
+res_wt_Stat3_df$color <- factor(res_wt_Stat3_df$color)
+MAplot_wt_v_STAT3_GOI <- ggplot(data = res_wt_Stat3_df, aes(x = baseMean, y = log2FoldChange, color = color, alpha = trans, size=size)) +
+  geom_point() +
+  scale_x_continuous(trans = 'log10') +
+  scale_alpha_continuous(guide=FALSE) +
+  scale_size_continuous(guide=FALSE, range = c(1,3)) +
+  scale_color_manual(values=color_genes, guide=FALSE) +
+  ylim(c(-15, 15)) +
+  geom_hline(yintercept=c(-1,1), linetype="dotted") +
+  xlab("mean expression") +
+  ylab("log fold change") +
+  ggtitle("wt vs. STAT3") +
+  theme_tufte()
+MAplot_wt_v_STAT3_GOI
+ggsave(plot = MAplot_wt_v_STAT3_GOI, filename = "MAplot_wt_v_STAT3_GOI.pdf", width=6, height=4, useDingbats=FALSE)
+```
+
+Outputting the Session Info
+```{r sessionInfo, echo=TRUE, warning=FALSE, message = FALSE, eval=TRUE}
+sessionInfo()
+```
